@@ -1,5 +1,7 @@
 import os
 
+RATE_URL = "https://t.me/botsarchive"
+
 # ─── BOT CREDENTIALS ───────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "6966644189:AAFNRvKiUNxC4QOgeeXGPY1wWU1tSH6aSZM")
 API_ID    = int(os.environ.get("API_ID", "38252985"))          # Telegram API ID
