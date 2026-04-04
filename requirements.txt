@@ -3,3 +3,4 @@ telethon
 motor
 httpx
 gdown
+Pillow
