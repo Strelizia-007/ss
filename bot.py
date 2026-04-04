@@ -20,7 +20,6 @@ from typing import Optional
 from telethon import TelegramClient, events
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl import types as tl_types
-from telethon.sessions import StringSession
 
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from telegram.constants import ParseMode
@@ -540,14 +539,15 @@ async def main():
     await bot.initialize()
     logger.info("PTB Bot initialized (send-only) ✅")
 
-    tele = TelegramClient(
-        StringSession(config.TELETHON_SESSION),
-        config.API_ID,
-        config.API_HASH
-    )
+    # Use file-based session — persists auth between restarts, no StringSession issues
+    session_path = os.path.join(os.path.dirname(__file__), "bot_session")
+    tele = TelegramClient(session_path, config.API_ID, config.API_HASH)
     register_handlers(tele)
     await tele.start(bot_token=config.BOT_TOKEN)
-    logger.info("Telethon receiving ALL updates ✅")
+
+    # Verify the session is actually receiving updates
+    me = await tele.get_me()
+    logger.info(f"Telethon connected as @{me.username} (id={me.id}) ✅")
 
     # Confirm bot is alive by messaging the first admin
     try:
