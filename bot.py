@@ -354,14 +354,19 @@ async def resolve_file(ctx: ContextTypes.DEFAULT_TYPE, tmpdir: str) -> Optional[
     dest = os.path.join(tmpdir, file_name)
 
     if file_id and tele_client:
-        # Use Telethon to fetch the message and download media — no 20 MB limit
+        # Look up the raw Telethon Message from the cache populated by the
+        # Telethon NewMessage handler — avoids all peer resolution issues.
         try:
-            tg_msg = await tele_client.get_messages(chat_id, ids=msg_id)
-            if tg_msg and tg_msg.media:
-                await tele_client.download_media(tg_msg.media, file=dest)
-                if os.path.exists(dest) and os.path.getsize(dest) > 0:
-                    return dest
-            logger.error("Telethon: message or media not found")
+            chat_id = ctx.user_data.get("chat_id")
+            msg_id  = ctx.user_data.get("msg_id")
+            tele_msg = _tele_msg_cache.get((chat_id, msg_id))
+            if tele_msg is None:
+                logger.error(f"Telethon: no cached message for ({chat_id}, {msg_id})")
+                return None
+            result = await tele_client.download_media(tele_msg, file=dest)
+            if result and os.path.exists(dest) and os.path.getsize(dest) > 0:
+                return dest
+            logger.error("Telethon: download_media returned no result")
             return None
         except Exception as e:
             logger.error(f"Telethon download error: {e}")
@@ -754,6 +759,12 @@ async def handle_combined_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_media(update, ctx)
 
 
+# ─── Telethon message cache: (chat_id, msg_id) → Telethon Message object ─────
+# Populated by a Telethon event handler running in parallel with PTB.
+# Used by resolve_file to download media without peer resolution issues.
+_tele_msg_cache: dict = {}
+
+
 async def main():
     global tele_client
 
@@ -765,6 +776,16 @@ async def main():
     )
     await tele_client.start(bot_token=config.BOT_TOKEN)
     logger.info("Telethon client started ✅")
+
+    # Register Telethon handler to cache every incoming media message
+    from telethon import events as tele_events
+
+    @tele_client.on(tele_events.NewMessage(incoming=True))
+    async def _cache_message(event):
+        if event.message and event.message.media:
+            key = (event.chat_id, event.message.id)
+            _tele_msg_cache[key] = event.message
+            logger.debug(f"Cached Telethon msg {key}")
 
     app = build_app()
     await app.initialize()
