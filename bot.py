@@ -266,7 +266,16 @@ async def process_thumb(uid: int, chat_id: int):
 
 def register_handlers(client: TelegramClient):
 
-    @client.on(events.NewMessage(pattern=r"^/start"))
+    # Catch-all debug handler — logs every single incoming update
+    @client.on(events.NewMessage())
+    async def _debug_all(event):
+        logger.info(f"[DEBUG] NewMessage from {event.sender_id} chat={event.chat_id} text={repr(event.raw_text[:80])} media={bool(event.media)}")
+
+    @client.on(events.CallbackQuery())
+    async def _debug_cb(event):
+        logger.info(f"[DEBUG] CallbackQuery from {event.sender_id} data={event.data}")
+
+    @client.on(events.NewMessage(pattern=r"^/start(@\w+)?"))
     async def on_start(event):
         uid     = event.sender_id
         chat_id = event.chat_id
@@ -289,20 +298,20 @@ def register_handlers(client: TelegramClient):
         await bot.send_message(chat_id,
             config.START_TEXT.format(name=name), parse_mode=ParseMode.MARKDOWN)
 
-    @client.on(events.NewMessage(pattern=r"^/help"))
+    @client.on(events.NewMessage(pattern=r"^/help(@\w+)?"))
     async def on_help(event):
         await bot.send_message(event.chat_id, config.HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
-    @client.on(events.NewMessage(pattern=r"^/privacy"))
+    @client.on(events.NewMessage(pattern=r"^/privacy(@\w+)?"))
     async def on_privacy(event):
         await bot.send_message(event.chat_id, config.PRIVACY_TEXT, parse_mode=ParseMode.MARKDOWN)
 
-    @client.on(events.NewMessage(pattern=r"^/donate"))
+    @client.on(events.NewMessage(pattern=r"^/donate(@\w+)?"))
     async def on_donate(event):
         await bot.send_message(event.chat_id, config.DONATE_TEXT,
             parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
-    @client.on(events.NewMessage(pattern=r"^/settings"))
+    @client.on(events.NewMessage(pattern=r"^/settings(@\w+)?"))
     async def on_settings(event):
         s = await db.get_user_settings(event.sender_id)
         await bot.send_message(event.chat_id,
@@ -427,7 +436,7 @@ def register_handlers(client: TelegramClient):
                 parse_mode=ParseMode.MARKDOWN)
 
     # Admin commands
-    @client.on(events.NewMessage(pattern=r"^/promote"))
+    @client.on(events.NewMessage(pattern=r"^/promote(@\w+)?"))
     async def on_promote(event):
         if not is_admin(event.sender_id): return
         parts = event.raw_text.split()
@@ -442,7 +451,7 @@ def register_handlers(client: TelegramClient):
         except Exception: pass
         await bot.send_message(event.chat_id, f"✅ User `{uid}` promoted.", parse_mode=ParseMode.MARKDOWN)
 
-    @client.on(events.NewMessage(pattern=r"^/demote"))
+    @client.on(events.NewMessage(pattern=r"^/demote(@\w+)?"))
     async def on_demote(event):
         if not is_admin(event.sender_id): return
         parts = event.raw_text.split()
@@ -450,7 +459,7 @@ def register_handlers(client: TelegramClient):
         await db.demote_user(int(parts[1]))
         await bot.send_message(event.chat_id, f"✅ User `{parts[1]}` demoted.", parse_mode=ParseMode.MARKDOWN)
 
-    @client.on(events.NewMessage(pattern=r"^/verify"))
+    @client.on(events.NewMessage(pattern=r"^/verify(@\w+)?"))
     async def on_verify(event):
         if not is_admin(event.sender_id): return
         if event.is_private:
@@ -459,13 +468,13 @@ def register_handlers(client: TelegramClient):
         await db.verify_group(event.chat_id, event.sender_id)
         await bot.send_message(event.chat_id, f"✅ *{chat.title}* verified.", parse_mode=ParseMode.MARKDOWN)
 
-    @client.on(events.NewMessage(pattern=r"^/unverify"))
+    @client.on(events.NewMessage(pattern=r"^/unverify(@\w+)?"))
     async def on_unverify(event):
         if not is_admin(event.sender_id): return
         await db.unverify_group(event.chat_id)
         await bot.send_message(event.chat_id, "✅ Group unverified.")
 
-    @client.on(events.NewMessage(pattern=r"^/broadcast"))
+    @client.on(events.NewMessage(pattern=r"^/broadcast(@\w+)?"))
     async def on_broadcast(event):
         if not is_admin(event.sender_id): return
         if not event.message.reply_to_msg_id:
@@ -505,7 +514,7 @@ def register_handlers(client: TelegramClient):
         except Exception as e:
             logger.error(f"join_request handler error: {e}")
 
-    @client.on(events.NewMessage(pattern=r"^/stats"))
+    @client.on(events.NewMessage(pattern=r"^/stats(@\w+)?"))
     async def on_stats(event):
         if not is_admin(event.sender_id): return
         daily  = await db.get_stats_range(1)
