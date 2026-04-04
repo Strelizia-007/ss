@@ -345,10 +345,14 @@ async def resolve_file(ctx: ContextTypes.DEFAULT_TYPE, tmpdir: str) -> Optional[
     dest = os.path.join(tmpdir, file_name)
 
     if file_id:
-        # get_file raises BadRequest for files >20 MB — use the file_path URL directly
+        # get_file() raises BadRequest for files >20 MB via download_to_drive,
+        # but file_path is a *relative* path like "videos/file_xxx.mp4".
+        # Construct the full Bot API URL manually to stream-download with httpx.
         try:
             tg_file = await ctx.bot.get_file(file_id)
-            file_url = tg_file.file_path  # full HTTPS URL, no size limit for download
+            relative_path = tg_file.file_path
+            file_url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{relative_path}"
+            logger.info(f"Downloading TG file from: {file_url}")
             ok = await download_direct_link(file_url, dest)
             return dest if ok else None
         except Exception as e:
