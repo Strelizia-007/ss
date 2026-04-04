@@ -81,9 +81,12 @@ async def download_gdrive_file(file_id: str, dest: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_ffprobe(path: str) -> Optional[dict]:
+    """path can be a local file path or an HTTPS URL — ffprobe handles both."""
     cmd = [
         "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_format", "-show_streams", path
+        "-show_format", "-show_streams",
+        "-timeout", "30000000",   # 30s timeout for URL probing
+        path
     ]
     try:
         out = subprocess.check_output(cmd, timeout=60)
