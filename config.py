@@ -7,6 +7,7 @@ API_HASH  = os.environ.get("API_HASH", "a2f2ed5c28a2b3cdf0a80d20aca37ff1") # Tel
 
 # ─── ADMIN ─────────────────────────────────────────────────────────────────────
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "7099019912").split(",")]
+TELETHON_SESSION = os.environ.get("TELETHON_SESSION", "1BVtsOLwBu4wMbXfahSGY1-qbcRA4_Fevj7tateGd4XYfb29_jKvaqTcD1ilLvU0y4XGNaHI67yPBVAU2iO10sjp0A3re_5l2ZVDpjer6GqkPITDH4yAxE2OqJbf2dRVblMaE4UGjP1oHZHYyj2_9sZAmskG9oiRK8zCPmGPYHVIZ016ix5nYTO3UwqtCHema2p3yHJeJkTh7-s7q1U1SJ88ryflhQr62DDTdhQDlSp2jpqFtCmz2LxngWEkj38Nzkp0PwmCqj-LE6HsmVQjoOK49f-n60yOh7xhGao6oM9O_NVi_nIUuXGAJLJNMwLUehKZVwQobquYIA94V0-5QuamCVTKcuLQ=")
 
 # ─── CHANNELS ──────────────────────────────────────────────────────────────────
 FSUB_CHANNEL_ID   = int(os.environ.get("FSUB_CHANNEL_ID", "-1002639102846"))  # Private channel ID
