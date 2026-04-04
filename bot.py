@@ -291,11 +291,9 @@ async def process_mediainfo(uid: int, chat_id: int):
             tg_url   = await upload_to_telegraph(f"MediaInfo · {file_name}", full, config.TELEGRAPH_TOKEN)
 
             # Build caption
-            caption = f"📊 *MediaInfo of* `{file_name}`
-"
+            caption = f"📊 *MediaInfo of* `{file_name}`"
             if tg_url:
-                caption += f"
-[🔗 View on Telegraph]({tg_url})"
+                caption += f"[🔗 View on Telegraph]({tg_url})"
             await bot.send_message(chat_id, caption, parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=False)
 
