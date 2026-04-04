@@ -137,16 +137,51 @@ async def resolve_file(uid: int, tmpdir: str) -> Optional[str]:
             if tele_doc is None:
                 logger.error("No tele_doc stored in user_state")
                 return None
-            # iter_download streams directly from Telegram's media DC
-            # It handles DC migration internally without hanging
-            with open(dest, "wb") as f:
-                async for chunk in tele.iter_download(tele_doc):
-                    f.write(chunk)
+
+            from telethon.tl.types import InputDocumentFileLocation
+            from telethon.tl.functions.upload import GetFileRequest
+
+            # Build explicit file location with the document's own dc_id
+            # This bypasses the "borrowed sender" DC migration that hangs
+            loc = InputDocumentFileLocation(
+                id=tele_doc.id,
+                access_hash=tele_doc.access_hash,
+                file_reference=tele_doc.file_reference,
+                thumb_size="",
+            )
+            dc_id = tele_doc.dc_id
+            logger.info(f"Document dc_id={dc_id} size={tele_doc.size} bytes")
+
+            # Get a sender connected directly to the document's DC
+            sender = await tele._borrow_exported_sender(dc_id)
+            try:
+                chunk_size = 512 * 1024  # 512KB
+                offset = 0
+                total  = tele_doc.size
+                with open(dest, "wb") as f:
+                    while offset < total:
+                        req = GetFileRequest(
+                            location=loc,
+                            offset=offset,
+                            limit=chunk_size,
+                            precise=True,
+                            cdn_supported=False,
+                        )
+                        result = await sender.send(req)
+                        chunk  = result.bytes
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        offset += len(chunk)
+                        if offset % (10 * 1024 * 1024) < chunk_size:
+                            logger.info(f"  {offset/1024/1024:.1f}/{total/1024/1024:.1f} MB")
+            finally:
+                await tele._return_exported_sender(sender)
+
             if os.path.exists(dest) and os.path.getsize(dest) > 0:
-                size_mb = os.path.getsize(dest) / 1024 / 1024
-                logger.info(f"Downloaded: {dest} ({size_mb:.1f} MB)")
+                logger.info(f"Downloaded: {os.path.getsize(dest)/1024/1024:.1f} MB")
                 return dest
-            logger.error("iter_download produced empty file")
+            logger.error("Download produced empty file")
         except Exception as e:
             logger.error(f"resolve_file error: {e}", exc_info=True)
         return None
