@@ -7,6 +7,8 @@
 
 import os, asyncio, tempfile, logging
 from typing import Optional
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton,
     InputMediaPhoto, ChatJoinRequest
@@ -32,6 +34,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ─── Telethon MTProto client (bypasses Bot API 20 MB getFile limit) ──────────
+tele_client: Optional[TelegramClient] = None
 
 # ─── Conversation states ─────────────────────────────────────────────────────
 AWAITING_TRIM_TIME   = 1
@@ -323,6 +328,8 @@ async def handle_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["file_id"]   = file_id
     ctx.user_data["link_text"] = link_text
     ctx.user_data["file_name"] = file_name
+    ctx.user_data["msg_id"]    = message.message_id
+    ctx.user_data["chat_id"]   = chat.id
 
     await message.reply_text(
         f"✅ **File received!**\n`{file_name}`\n\n"
@@ -337,26 +344,27 @@ async def handle_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def resolve_file(ctx: ContextTypes.DEFAULT_TYPE, tmpdir: str) -> Optional[str]:
-    """Download/get the file into tmpdir. Returns path or None."""
+    """Download file into tmpdir. Uses Telethon MTProto for TG files (no size limit)."""
     file_id   = ctx.user_data.get("file_id")
     link_text = ctx.user_data.get("link_text")
     file_name = ctx.user_data.get("file_name", "video.mp4")
+    msg_id    = ctx.user_data.get("msg_id")
+    chat_id   = ctx.user_data.get("chat_id")
 
     dest = os.path.join(tmpdir, file_name)
 
-    if file_id:
-        # get_file() raises BadRequest for files >20 MB via download_to_drive,
-        # but file_path is a *relative* path like "videos/file_xxx.mp4".
-        # Construct the full Bot API URL manually to stream-download with httpx.
+    if file_id and tele_client:
+        # Use Telethon to fetch the message and download media — no 20 MB limit
         try:
-            tg_file = await ctx.bot.get_file(file_id)
-            relative_path = tg_file.file_path
-            file_url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{relative_path}"
-            logger.info(f"Downloading TG file from: {file_url}")
-            ok = await download_direct_link(file_url, dest)
-            return dest if ok else None
+            tg_msg = await tele_client.get_messages(chat_id, ids=msg_id)
+            if tg_msg and tg_msg.media:
+                await tele_client.download_media(tg_msg.media, file=dest)
+                if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                    return dest
+            logger.error("Telethon: message or media not found")
+            return None
         except Exception as e:
-            logger.error(f"resolve_file telegram error: {e}")
+            logger.error(f"Telethon download error: {e}")
             return None
 
     if link_text:
@@ -732,7 +740,7 @@ def build_app() -> Application:
     ))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
-        handle_combined_text   # defined below
+        handle_combined_text
     ))
 
     return app
@@ -746,7 +754,35 @@ async def handle_combined_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_media(update, ctx)
 
 
-if __name__ == "__main__":
+async def main():
+    global tele_client
+
+    # Start Telethon bot client (MTProto — no file size limit)
+    tele_client = TelegramClient(
+        StringSession(config.TELETHON_SESSION),
+        config.API_ID,
+        config.API_HASH
+    )
+    await tele_client.start(bot_token=config.BOT_TOKEN)
+    logger.info("Telethon client started ✅")
+
     app = build_app()
-    logger.info("Starting Screenshot Generator Bot...")
-    app.run_polling(drop_pending_updates=True)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    logger.info("PTB bot polling started ✅")
+
+    # Run until interrupted
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await tele_client.disconnect()
+        logger.info("Bot stopped.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
