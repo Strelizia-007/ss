@@ -1,27 +1,20 @@
-"""
-╔══════════════════════════════════════════════╗
-║         SCREENSHOT GENERATOR BOT             ║
-║              Configuration                   ║
-╚══════════════════════════════════════════════╝
-"""
-
 import os
 
 # ─── BOT CREDENTIALS ───────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-API_ID    = int(os.environ.get("API_ID", "0"))          # Telegram API ID
-API_HASH  = os.environ.get("API_HASH", "YOUR_API_HASH") # Telegram API Hash
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "6966644189:AAFNRvKiUNxC4QOgeeXGPY1wWU1tSH6aSZM")
+API_ID    = int(os.environ.get("API_ID", "38252985"))          # Telegram API ID
+API_HASH  = os.environ.get("API_HASH", "a2f2ed5c28a2b3cdf0a80d20aca37ff1") # Telegram API Hash
 
 # ─── ADMIN ─────────────────────────────────────────────────────────────────────
-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "123456789").split(",")]
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "7099019912").split(",")]
 
 # ─── CHANNELS ──────────────────────────────────────────────────────────────────
-FSUB_CHANNEL_ID   = int(os.environ.get("FSUB_CHANNEL_ID", "-100xxxxxxxxxx"))  # Private channel ID
-SUPPORT_GROUP_ID  = int(os.environ.get("SUPPORT_GROUP_ID", "-100xxxxxxxxxx")) # Support group for 18+ alerts
-LOG_CHANNEL_ID    = int(os.environ.get("LOG_CHANNEL_ID", "-100xxxxxxxxxx"))   # Bot log channel
+FSUB_CHANNEL_ID   = int(os.environ.get("FSUB_CHANNEL_ID", "-1002639102846"))  # Private channel ID
+SUPPORT_GROUP_ID  = int(os.environ.get("SUPPORT_GROUP_ID", "-1002606525304")) # Support group for 18+ alerts
+LOG_CHANNEL_ID    = int(os.environ.get("LOG_CHANNEL_ID", "-1002116542152"))   # Bot log channel
 
 # ─── DATABASE ──────────────────────────────────────────────────────────────────
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://MV:MV@cluster0.rfx5f4x.mongodb.net/?appName=Cluster0")
 DB_NAME   = "screenshotbot"
 
 # ─── TELEGRAPH ─────────────────────────────────────────────────────────────────
