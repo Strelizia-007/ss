@@ -6,7 +6,7 @@ import os, re, asyncio, subprocess, tempfile, math, json, logging
 from pathlib import Path
 from typing import Optional
 import httpx
-from config import ADULT_KEYWORDS, GDRIVE_SERVICE_ACCOUNT_JSON
+from config import ADULT_KEYWORDS
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_adult_content(filename: str, caption: str = "") -> bool:
-    """Check filename and caption for adult content keywords."""
     text = (filename + " " + caption).lower()
     return any(kw in text for kw in ADULT_KEYWORDS)
 
@@ -25,32 +24,26 @@ def is_adult_content(filename: str, caption: str = "") -> bool:
 #  LINK DETECTION & DOWNLOAD
 # ══════════════════════════════════════════════════════════════════════════════
 
-GDRIVE_FILE_RE   = re.compile(r"drive\.google\.com/file/d/([^/\s?]+)")
-GDRIVE_FOLDER_RE = re.compile(r"drive\.google\.com/drive/folders/([^/\s?]+)")
-DIRECT_LINK_RE   = re.compile(r"https?://[^\s]+\.(mp4|mkv|avi|mov|webm|ts|m2ts|flv)", re.IGNORECASE)
+GDRIVE_FILE_RE  = re.compile(r"drive\.google\.com/file/d/([^/\s?]+)")
+GDRIVE_FOLDER_RE= re.compile(r"drive\.google\.com/drive/folders/([^/\s?]+)")
+DIRECT_LINK_RE  = re.compile(r"https?://[^\s]+\.(mp4|mkv|avi|mov|webm|ts|m2ts|flv)", re.IGNORECASE)
 
 
 def detect_link_type(text: str) -> tuple[str, str]:
-    """Returns (type, identifier). type: direct | gdrive_file | gdrive_folder | unsupported"""
-    if m := GDRIVE_FILE_RE.search(text):
-        return "gdrive_file", m.group(1)
-    if m := GDRIVE_FOLDER_RE.search(text):
-        return "gdrive_folder", m.group(1)
-    if m := DIRECT_LINK_RE.search(text):
-        return "direct", m.group(0)
-    if text.startswith("http"):
-        return "unsupported", text
+    if m := GDRIVE_FILE_RE.search(text):  return "gdrive_file",   m.group(1)
+    if m := GDRIVE_FOLDER_RE.search(text):return "gdrive_folder", m.group(1)
+    if m := DIRECT_LINK_RE.search(text):  return "direct",        m.group(0)
+    if text.startswith("http"):           return "unsupported",   text
     return "none", ""
 
 
 async def download_direct_link(url: str, dest: str) -> bool:
-    """Download a direct HTTP/HTTPS link to dest path."""
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=300) as client:
             async with client.stream("GET", url) as r:
                 r.raise_for_status()
                 with open(dest, "wb") as f:
-                    async for chunk in r.aiter_bytes(1024 * 512):
+                    async for chunk in r.aiter_bytes(512 * 1024):
                         f.write(chunk)
         return True
     except Exception as e:
@@ -59,11 +52,9 @@ async def download_direct_link(url: str, dest: str) -> bool:
 
 
 async def download_gdrive_file(file_id: str, dest: str) -> bool:
-    """Download a Google Drive file using gdown."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            "gdown", f"https://drive.google.com/uc?id={file_id}",
-            "-O", dest, "--fuzzy",
+            "gdown", f"https://drive.google.com/uc?id={file_id}", "-O", dest, "--fuzzy",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         _, stderr = await proc.communicate()
@@ -77,15 +68,14 @@ async def download_gdrive_file(file_id: str, dest: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MEDIA INFO
+#  FFPROBE  (accepts local path or HTTPS URL)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_ffprobe(path: str) -> Optional[dict]:
-    """path can be a local file path or an HTTPS URL — ffprobe handles both."""
     cmd = [
         "ffprobe", "-v", "quiet", "-print_format", "json",
         "-show_format", "-show_streams",
-        "-timeout", "30000000",   # 30s timeout for URL probing
+        "-timeout", "30000000",
         path
     ]
     try:
@@ -96,61 +86,52 @@ def run_ffprobe(path: str) -> Optional[dict]:
         return None
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  MEDIA INFO
+# ══════════════════════════════════════════════════════════════════════════════
+
 def parse_simple_mediainfo(path: str) -> str:
-    """Return a short human-readable media summary."""
     data = run_ffprobe(path)
     if not data:
         return "❌ Could not read media info."
-
     fmt      = data.get("format", {})
     streams  = data.get("streams", [])
     duration = float(fmt.get("duration", 0))
     h, rem   = divmod(int(duration), 3600)
     m, s     = divmod(rem, 60)
     dur_str  = f"{h:02d}:{m:02d}:{s:02d}"
-
     video    = next((s for s in streams if s.get("codec_type") == "video"), None)
     audios   = [s for s in streams if s.get("codec_type") == "audio"]
     subs     = [s for s in streams if s.get("codec_type") == "subtitle"]
-
     quality  = "Unknown"
     codec    = ""
-    bit_depth = ""
+    bit_depth= ""
     if video:
         h_px = video.get("height", 0)
         for res, label in [(2160,"2160p"),(1440,"1440p"),(1080,"1080p"),(720,"720p"),(480,"480p")]:
             if h_px >= res:
-                quality = label
-                break
-        cname = video.get("codec_name","").upper()
+                quality = label; break
+        cname     = video.get("codec_name","").upper()
         codec_map = {"HEVC":"HEVC","H265":"HEVC","H264":"H264","AVC":"H264","AV1":"AV1","VP9":"VP9"}
-        codec = codec_map.get(cname, cname)
-        pix  = video.get("pix_fmt","")
-        bit_depth = " 10bit" if "10" in pix else " 8bit"
-
-    langs = list({a.get("tags",{}).get("language","und") for a in audios})
+        codec     = codec_map.get(cname, cname)
+        bit_depth = " 10bit" if "10" in video.get("pix_fmt","") else " 8bit"
+    langs     = list({a.get("tags",{}).get("language","und") for a in audios})
     sub_langs = list({s.get("tags",{}).get("language","und") for s in subs})
-
-    size  = int(fmt.get("size", 0))
-    size_mb = round(size / 1024 / 1024, 1)
-
-    lines = [
+    size_mb   = round(int(fmt.get("size", 0)) / 1024 / 1024, 1)
+    return "\n".join([
         f"🎬 **Quality:** `{quality} {codec}{bit_depth}`",
         f"🌐 **Language:** `{', '.join(langs) or 'N/A'}`",
         f"📝 **Subtitle:** `{', '.join(sub_langs) or 'None'}`",
         f"⏱ **Duration:** `{dur_str}`",
         f"💾 **Size:** `{size_mb} MB`",
-    ]
-    return "\n".join(lines)
+    ])
 
 
 def parse_detailed_mediainfo(path: str) -> str:
-    """Full mediainfo output as text for Telegraph."""
     try:
         out = subprocess.check_output(["mediainfo", path], timeout=60)
         return out.decode("utf-8", errors="replace")
     except FileNotFoundError:
-        # Fall back to ffprobe JSON if mediainfo binary not available
         data = run_ffprobe(path)
         return json.dumps(data, indent=2) if data else "mediainfo not available"
     except Exception as e:
@@ -162,26 +143,17 @@ def parse_detailed_mediainfo(path: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def upload_to_telegraph(title: str, content: str, token: str = "") -> Optional[str]:
-    """Upload text content to Telegraph and return URL."""
-    node = [{"tag": "pre", "children": [content]}]
-    payload = {
-        "title": title,
-        "author_name": "ScreenshotBot",
-        "content": json.dumps(node),
-    }
-    base = "https://api.telegra.ph"
+    node    = [{"tag": "pre", "children": [content]}]
+    payload = {"title": title, "author_name": "ScreenshotBot", "content": json.dumps(node)}
+    base    = "https://api.telegra.ph"
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            if token:
-                r = await client.post(f"{base}/createPage?access_token={token}", data=payload)
-            else:
-                # Create an account first if no token
-                acc = await client.post(f"{base}/createAccount",
-                                        data={"short_name":"ScreenBot","author_name":"ScreenBot"})
-                acc_data = acc.json()
-                tok = acc_data["result"]["access_token"]
-                payload["access_token"] = tok
-                r = await client.post(f"{base}/createPage", data=payload)
+            if not token:
+                acc   = await client.post(f"{base}/createAccount",
+                            data={"short_name":"ScreenBot","author_name":"ScreenBot"})
+                token = acc.json()["result"]["access_token"]
+            payload["access_token"] = token
+            r      = await client.post(f"{base}/createPage", data=payload)
             result = r.json()
             if result.get("ok"):
                 return "https://telegra.ph" + result["result"]["path"]
@@ -191,8 +163,36 @@ async def upload_to_telegraph(title: str, content: str, token: str = "") -> Opti
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCREENSHOTS
+#  SCREENSHOTS  — parallel fast-seek, all frames in one ffmpeg call
 # ══════════════════════════════════════════════════════════════════════════════
+
+async def get_duration(input_path: str) -> float:
+    """Get video duration via ffprobe. Works with URLs."""
+    data = run_ffprobe(input_path)
+    if not data:
+        return 0.0
+    return float(data.get("format", {}).get("duration", 0))
+
+
+async def _grab_one_frame(input_path: str, ts: float, out: str) -> Optional[str]:
+    """Extract a single frame at timestamp ts. Fast: -ss BEFORE -i for keyframe seek."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{ts:.3f}",        # seek BEFORE input = fast keyframe seek
+        "-i", input_path,
+        "-vframes", "1",
+        "-q:v", "3",               # JPEG quality 3 (good balance)
+        "-vf", "scale=1280:-2",    # cap width at 1280px, keep aspect
+        out
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
+    )
+    await proc.wait()
+    return out if os.path.exists(out) and os.path.getsize(out) > 0 else None
+
 
 async def generate_screenshots(
     input_path: str,
@@ -200,58 +200,69 @@ async def generate_screenshots(
     output_dir: str,
     mode: str = "equally_spaced"
 ) -> list[str]:
-    """Generate `count` screenshots. Returns list of output PNG paths."""
-    data = run_ffprobe(input_path)
-    if not data:
-        return []
-
-    duration = float(data.get("format", {}).get("duration", 0))
+    """
+    Generate `count` screenshots in PARALLEL.
+    All ffmpeg processes run concurrently — total time ≈ single frame time.
+    """
+    duration = await get_duration(input_path)
     if duration <= 0:
         return []
 
-    timestamps = [duration * (i + 1) / (count + 1) for i in range(count)]
+    # Equally spaced, skip first/last 2% to avoid black frames
+    margin     = duration * 0.02
+    span       = duration - 2 * margin
+    timestamps = [margin + span * (i / max(count - 1, 1)) for i in range(count)]
 
-    paths = []
-    for i, ts in enumerate(timestamps):
-        out = os.path.join(output_dir, f"scht_{i:03d}.jpg")
-        cmd = [
-            "ffmpeg", "-ss", str(ts), "-i", input_path,
-            "-vframes", "1", "-q:v", "2", "-y", out
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-        )
-        await proc.wait()
-        if os.path.exists(out) and os.path.getsize(out) > 0:
-            paths.append(out)
-    return paths
+    # Launch all frame grabs concurrently
+    tasks = [
+        _grab_one_frame(input_path, ts, os.path.join(output_dir, f"scht_{i:03d}.jpg"))
+        for i, ts in enumerate(timestamps)
+    ]
+    results = await asyncio.gather(*tasks)
+    return [r for r in results if r]
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TILE IMAGE  — Pillow montage (fast, no ffmpeg filter_complex hang)
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def make_tile_image(images: list[str], output_path: str, cols: int = 3) -> bool:
-    """Combine images into a tile mosaic using ffmpeg."""
-    rows = math.ceil(len(images) / cols)
-    # Build ffmpeg tile filter
-    inputs  = []
-    for img in images:
-        inputs += ["-i", img]
+    """
+    Stitch screenshots into a tile grid using Pillow.
+    Much faster and more reliable than ffmpeg filter_complex for this use case.
+    """
+    def _build_tile():
+        try:
+            from PIL import Image
+        except ImportError:
+            logger.error("Pillow not installed — run: pip install Pillow")
+            return False
 
-    # Scale each to uniform size then tile
-    filters = []
-    for j in range(len(images)):
-        filters.append(f"[{j}:v]scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2[v{j}]")
+        thumb_w, thumb_h = 640, 360
+        rows  = math.ceil(len(images) / cols)
+        tile  = Image.new("RGB", (thumb_w * cols, thumb_h * rows), (20, 20, 20))
 
-    tile_inputs = "".join(f"[v{j}]" for j in range(len(images)))
-    filters.append(f"{tile_inputs}tile={cols}x{rows}[out]")
+        for idx, img_path in enumerate(images):
+            try:
+                img = Image.open(img_path).convert("RGB")
+                img.thumbnail((thumb_w, thumb_h), Image.LANCZOS)
+                # Center-pad to thumb_w x thumb_h
+                bg  = Image.new("RGB", (thumb_w, thumb_h), (20, 20, 20))
+                off = ((thumb_w - img.width) // 2, (thumb_h - img.height) // 2)
+                bg.paste(img, off)
+                col = idx % cols
+                row = idx // cols
+                tile.paste(bg, (col * thumb_w, row * thumb_h))
+            except Exception as e:
+                logger.warning(f"Tile: skipping {img_path}: {e}")
 
-    cmd = ["ffmpeg", "-y"] + inputs + [
-        "-filter_complex", ";".join(filters),
-        "-map", "[out]", "-q:v", "2", output_path
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
-    )
-    _, err = await proc.communicate()
-    return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+        tile.save(output_path, "JPEG", quality=85, optimize=True)
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+
+    # Run in thread so it doesn't block the event loop
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _build_tile)
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -259,10 +270,10 @@ async def make_tile_image(images: list[str], output_path: str, cols: int = 3) ->
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def trim_video(input_path: str, start: str, end: str, output_path: str) -> bool:
-    """Trim video from start to end (HH:MM:SS or seconds)."""
     cmd = [
-        "ffmpeg", "-y", "-i", input_path,
+        "ffmpeg", "-y",
         "-ss", start, "-to", end,
+        "-i", input_path,
         "-c", "copy", output_path
     ]
     proc = await asyncio.create_subprocess_exec(
@@ -273,7 +284,6 @@ async def trim_video(input_path: str, start: str, end: str, output_path: str) ->
 
 
 def parse_time_range(text: str):
-    """Parse 'HH:MM:SS - HH:MM:SS' or 'SS - SS' → (start, end) strings."""
     parts = re.split(r"\s*[-–]\s*", text.strip())
     if len(parts) == 2:
         return parts[0].strip(), parts[1].strip()
@@ -285,17 +295,19 @@ def parse_time_range(text: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def generate_sample_video(input_path: str, duration_sec: int, output_path: str) -> bool:
-    """Extract a sample clip from the middle of the video."""
-    data = run_ffprobe(input_path)
+    data  = run_ffprobe(input_path)
     if not data:
         return False
     total = float(data.get("format", {}).get("duration", 0))
     start = max(0, (total / 2) - (duration_sec / 2))
     cmd = [
-        "ffmpeg", "-y", "-ss", str(start), "-i", input_path,
+        "ffmpeg", "-y",
+        "-ss", str(start),
+        "-i", input_path,
         "-t", str(duration_sec),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k", output_path
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+        "-c:a", "aac", "-b:a", "96k",
+        output_path
     ]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
@@ -305,16 +317,50 @@ async def generate_sample_video(input_path: str, duration_sec: int, output_path:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  THUMBNAILS / COVERS
+#  THUMBNAIL — use embedded cover art first, fall back to frame grab
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def extract_thumbnail(input_path: str, output_path: str, time: str = "00:00:10") -> bool:
-    cmd = [
-        "ffmpeg", "-y", "-ss", time, "-i", input_path,
-        "-vframes", "1", "-q:v", "1", output_path
+async def extract_thumbnail(input_path: str, output_path: str) -> bool:
+    """
+    Priority:
+    1. Embedded cover art / attached pic (fast, already in the file header)
+    2. Frame grab at 10s (fallback)
+    """
+    # Try extracting embedded cover art (stream type=video, codec=mjpeg/png/bmp)
+    cmd_cover = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-map", "0:v", "-map", "-0:V",   # select video streams, exclude actual video
+        "-frames:v", "1",
+        "-q:v", "1",
+        output_path
     ]
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        *cmd_cover,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
     )
     await proc.wait()
-    return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        logger.info("Thumbnail: extracted embedded cover art")
+        return True
+
+    # Fallback: grab frame at 10s
+    cmd_frame = [
+        "ffmpeg", "-y",
+        "-ss", "00:00:10",
+        "-i", input_path,
+        "-vframes", "1", "-q:v", "1",
+        "-vf", "scale=1280:-2",
+        output_path
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd_frame,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
+    )
+    await proc.wait()
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        logger.info("Thumbnail: extracted frame at 10s")
+        return True
+
+    return False
