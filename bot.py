@@ -355,24 +355,22 @@ async def resolve_file(ctx: ContextTypes.DEFAULT_TYPE, tmpdir: str) -> Optional[
 
     if file_id and tele_client:
         try:
-            chat_id  = ctx.user_data.get("chat_id")
-            msg_id   = ctx.user_data.get("msg_id")
-            is_group = chat_id and chat_id < 0   # negative = group/channel
-
-            # For private chats the bot receives messages in its own inbox ("me").
-            # For groups/channels use the actual chat_id (Telethon already knows it
-            # because the bot is a member, so no peer resolution error).
-            peer = chat_id if is_group else "me"
-            tele_msg = await tele_client.get_messages(peer, ids=msg_id)
-            logger.info(f"Telethon got: peer={peer} id={msg_id} msg={tele_msg}")
+            chat_id = ctx.user_data.get("chat_id")
+            msg_id  = ctx.user_data.get("msg_id")
+            key     = (chat_id, msg_id)
+            # Wait up to 5s for the Telethon NewMessage handler to cache this message.
+            # It fires on the same event loop but may lag slightly behind PTB.
+            for _ in range(10):
+                if key in _tele_msg_cache:
+                    break
+                await asyncio.sleep(0.5)
+            tele_msg = _tele_msg_cache.get(key)
             if tele_msg is None:
-                logger.error(f"Telethon: message not found at peer={peer} id={msg_id}")
-                return None
-            if not tele_msg.media:
-                logger.error(f"Telethon: media=None full_msg={tele_msg.to_dict()}")
+                logger.error(f"Telethon: message not in cache after wait. key={key}")
                 return None
             result = await tele_client.download_media(tele_msg, file=dest)
             if result and os.path.exists(dest) and os.path.getsize(dest) > 0:
+                _tele_msg_cache.pop(key, None)   # free memory after download
                 return dest
             logger.error("Telethon: download_media returned empty result")
             return None
@@ -767,6 +765,10 @@ async def handle_combined_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_media(update, ctx)
 
 
+# Cache: (chat_id, msg_id) → Telethon Message — populated before PTB polling starts
+_tele_msg_cache: dict = {}
+
+
 async def main():
     global tele_client
 
@@ -777,6 +779,20 @@ async def main():
     )
     await tele_client.start(bot_token=config.BOT_TOKEN)
     logger.info("Telethon client started ✅")
+
+    # Register BEFORE PTB starts so every update is cached in time
+    from telethon import events as tele_events
+
+    @tele_client.on(tele_events.NewMessage(incoming=True))
+    async def _on_tele_msg(event):
+        if event.message and event.message.media:
+            key = (event.chat_id, event.message.id)
+            _tele_msg_cache[key] = event.message
+            logger.debug(f"Telethon cached msg key={key}")
+
+    # Run Telethon in the background (non-blocking)
+    await tele_client.catch_up()
+    logger.info("Telethon handler registered ✅")
 
     app = build_app()
     await app.initialize()
