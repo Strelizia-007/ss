@@ -345,9 +345,15 @@ async def resolve_file(ctx: ContextTypes.DEFAULT_TYPE, tmpdir: str) -> Optional[
     dest = os.path.join(tmpdir, file_name)
 
     if file_id:
-        tg_file = await ctx.bot.get_file(file_id)
-        await tg_file.download_to_drive(dest)
-        return dest
+        # get_file raises BadRequest for files >20 MB — use the file_path URL directly
+        try:
+            tg_file = await ctx.bot.get_file(file_id)
+            file_url = tg_file.file_path  # full HTTPS URL, no size limit for download
+            ok = await download_direct_link(file_url, dest)
+            return dest if ok else None
+        except Exception as e:
+            logger.error(f"resolve_file telegram error: {e}")
+            return None
 
     if link_text:
         link_type, identifier = detect_link_type(link_text)
@@ -485,10 +491,46 @@ async def scht_count_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     _, count_str = query.data.split(":")
-    ctx.user_data["scht_count"] = int(count_str)
-    # Reuse action_callback logic
-    query.data = f"action:scht:{count_str}"
-    await action_callback(update, ctx)
+    count = int(count_str)
+
+    user_id     = query.from_user.id
+    user_rec    = await db.get_user(user_id)
+    settings    = user_rec["settings"]
+    limits      = get_user_limits(user_rec["tier"])
+    count       = min(count, limits["max_screenshots"])
+
+    processing_msg = await query.message.reply_text("⚙️ Generating screenshots... please wait.")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = await resolve_file(ctx, tmpdir)
+        if not path:
+            await processing_msg.edit_text("❌ Could not download the file. Please try again.")
+            return
+
+        images = await generate_screenshots(path, count, tmpdir, settings["scht_gen_mode"])
+        if not images:
+            await processing_msg.edit_text("❌ Screenshot generation failed.")
+            return
+
+        await db.increment_stat(user_id, "screenshots")
+
+        if settings["upload_mode"] == "tile":
+            tile_path = os.path.join(tmpdir, "tile.jpg")
+            ok = await make_tile_image(images, tile_path)
+            if ok:
+                with open(tile_path, "rb") as f:
+                    await query.message.reply_photo(photo=f, caption=f"📸 {count} screenshots")
+            else:
+                await processing_msg.edit_text("❌ Tile generation failed.")
+                return
+        else:
+            media_group = []
+            for img in images:
+                with open(img, "rb") as f:
+                    media_group.append(InputMediaPhoto(media=f.read()))
+            await query.message.reply_media_group(media=media_group)
+
+    await processing_msg.delete()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
