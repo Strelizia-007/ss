@@ -190,12 +190,10 @@ RATE_URL = "https://t.me/botsarchive"   # change to your bot's review link
 async def send_completion(chat_id: int, seconds: float):
     """Send the standard completion footer after every task."""
     text = (
-        f"✅ Successfully completed process in *{seconds:.0f}s*
-
-"
-        f"If you find me helpful, please [rate me here]({RATE_URL}).
-
-"
+        f"✅ Successfully completed process in *{seconds:.0f}s*"
+      
+        f"If you find me helpful, please [rate me here]({RATE_URL})."
+      
         f"💝 Support the bot with /donate and get *extended limits* too\!"
     )
     await bot.send_message(chat_id, text,
