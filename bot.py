@@ -6,6 +6,7 @@
 """
 
 import os, asyncio, tempfile, logging
+from typing import Optional
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton,
     InputMediaPhoto, ChatJoinRequest
