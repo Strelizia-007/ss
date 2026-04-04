@@ -120,79 +120,90 @@ def settings_keyboard(s: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FILE DOWNLOAD — Telethon download_media (no size limit)
+#  INPUT SOURCE — returns a streamable URL or local path for ffmpeg
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def resolve_file(uid: int, tmpdir: str) -> Optional[str]:
+async def get_input_source(uid: int, tmpdir: str) -> Optional[str]:
+    """
+    Returns a source that ffmpeg can read directly:
+    - For Telegram files: a Telegram HTTPS URL (ffmpeg streams it, no full download)
+    - For direct links: the URL itself
+    - For GDrive: downloads to tmpdir and returns local path
+    """
     state     = user_state.get(uid, {})
-    tele_msg  = state.get("tele_msg")
+    tele_doc  = state.get("tele_doc")
     link_text = state.get("link_text")
     file_name = state.get("file_name", "video.mp4")
-    dest      = os.path.join(tmpdir, file_name)
 
-    if tele_msg is not None:
+    if tele_doc is not None:
+        # Get a streamable HTTPS URL via Bot API getFile
+        # ffmpeg reads it directly — no local download needed at all
+        import httpx as _httpx
         try:
-            logger.info(f"Downloading via Telethon iter_download to {dest}...")
-            tele_doc = user_state.get(uid, {}).get("tele_doc")
-            if tele_doc is None:
-                logger.error("No tele_doc stored in user_state")
-                return None
+            # Build a temporary file_id from the document using Telethon's packer
+            from telethon.utils import pack_bot_file_id
+            file_id = pack_bot_file_id(tele_doc)
+        except Exception:
+            # Fallback: use document id as string (works for most cases)
+            file_id = str(tele_doc.id)
 
-            from telethon.tl.types import InputDocumentFileLocation
-            from telethon.tl.functions.upload import GetFileRequest
-
-            # Build explicit file location with the document's own dc_id
-            # This bypasses the "borrowed sender" DC migration that hangs
-            loc = InputDocumentFileLocation(
-                id=tele_doc.id,
-                access_hash=tele_doc.access_hash,
-                file_reference=tele_doc.file_reference,
-                thumb_size="",
-            )
-            dc_id = tele_doc.dc_id
-            logger.info(f"Document dc_id={dc_id} size={tele_doc.size} bytes")
-
-            # Get a sender connected directly to the document's DC
-            sender = await tele._borrow_exported_sender(dc_id)
-            try:
-                chunk_size = 512 * 1024  # 512KB
-                offset = 0
-                total  = tele_doc.size
-                with open(dest, "wb") as f:
-                    while offset < total:
-                        req = GetFileRequest(
-                            location=loc,
-                            offset=offset,
-                            limit=chunk_size,
-                            precise=True,
-                            cdn_supported=False,
-                        )
-                        result = await sender.send(req)
-                        chunk  = result.bytes
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        offset += len(chunk)
-                        if offset % (10 * 1024 * 1024) < chunk_size:
-                            logger.info(f"  {offset/1024/1024:.1f}/{total/1024/1024:.1f} MB")
-            finally:
-                await tele._return_exported_sender(sender)
-
-            if os.path.exists(dest) and os.path.getsize(dest) > 0:
-                logger.info(f"Downloaded: {os.path.getsize(dest)/1024/1024:.1f} MB")
-                return dest
-            logger.error("Download produced empty file")
+        try:
+            async with _httpx.AsyncClient(timeout=30) as cl:
+                r = await cl.get(
+                    f"https://api.telegram.org/bot{config.BOT_TOKEN}/getFile",
+                    params={"file_id": file_id}
+                )
+                data = r.json()
+                if data.get("ok"):
+                    fp  = data["result"]["file_path"]
+                    url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{fp}"
+                    logger.info(f"Stream URL for ffmpeg: {url}")
+                    return url
+                logger.warning(f"getFile failed ({data.get('description')}), falling back to full download")
         except Exception as e:
-            logger.error(f"resolve_file error: {e}", exc_info=True)
+            logger.warning(f"getFile URL fetch failed: {e}, falling back to full download")
+
+        # Fallback: full Telethon download (for files >20MB where getFile fails)
+        dest = os.path.join(tmpdir, file_name)
+        logger.info(f"Falling back to Telethon chunk download → {dest}")
+        from telethon.tl.types import InputDocumentFileLocation
+        from telethon.tl.functions.upload import GetFileRequest
+        loc    = InputDocumentFileLocation(
+            id=tele_doc.id,
+            access_hash=tele_doc.access_hash,
+            file_reference=tele_doc.file_reference,
+            thumb_size="",
+        )
+        sender = await tele._borrow_exported_sender(tele_doc.dc_id)
+        try:
+            chunk_size = 512 * 1024
+            offset, total = 0, tele_doc.size
+            with open(dest, "wb") as f:
+                while offset < total:
+                    result = await sender.send(GetFileRequest(
+                        location=loc, offset=offset, limit=chunk_size,
+                        precise=True, cdn_supported=False,
+                    ))
+                    chunk = result.bytes
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    offset += len(chunk)
+                    if offset % (50 * 1024 * 1024) < chunk_size:
+                        logger.info(f"  {offset/1024/1024:.0f}/{total/1024/1024:.0f} MB")
+        finally:
+            await tele._return_exported_sender(sender)
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            return dest
         return None
 
     if link_text:
         ltype, identifier = detect_link_type(link_text)
         if ltype == "direct":
-            ok = await download_direct_link(identifier, dest)
-            return dest if ok else None
+            return identifier          # ffmpeg can stream direct URLs natively
         elif ltype == "gdrive_file":
-            ok = await download_gdrive_file(identifier, dest)
+            dest = os.path.join(tmpdir, file_name)
+            ok   = await download_gdrive_file(identifier, dest)
             return dest if ok else None
 
     return None
@@ -209,7 +220,7 @@ async def process_screenshots(uid: int, chat_id: int, count: int):
     count    = min(count, limits["max_screenshots"])
     prog     = await bot.send_message(chat_id, f"⚙️ Generating {count} screenshots...")
     with tempfile.TemporaryDirectory() as tmpdir:
-        path = await resolve_file(uid, tmpdir)
+        path = await get_input_source(uid, tmpdir)
         if not path:
             await prog.edit_text("❌ Could not download the file."); return
         images = await generate_screenshots(path, count, tmpdir, settings["scht_gen_mode"])
@@ -235,7 +246,7 @@ async def process_sample(uid: int, chat_id: int):
     dur      = min(settings["sample_duration"], limits["max_sample_sec"])
     prog     = await bot.send_message(chat_id, f"⚙️ Generating {dur}s sample...")
     with tempfile.TemporaryDirectory() as tmpdir:
-        path = await resolve_file(uid, tmpdir)
+        path = await get_input_source(uid, tmpdir)
         if not path:
             await prog.edit_text("❌ Could not download the file."); return
         out = os.path.join(tmpdir, "sample.mp4")
@@ -250,7 +261,7 @@ async def process_sample(uid: int, chat_id: int):
 async def process_trim(uid: int, chat_id: int, start: str, end: str):
     prog = await bot.send_message(chat_id, "✂️ Trimming...")
     with tempfile.TemporaryDirectory() as tmpdir:
-        path = await resolve_file(uid, tmpdir)
+        path = await get_input_source(uid, tmpdir)
         if not path:
             await prog.edit_text("❌ Could not download the file."); return
         out = os.path.join(tmpdir, "trimmed.mp4")
@@ -267,7 +278,7 @@ async def process_mediainfo(uid: int, chat_id: int):
     settings = user_rec["settings"]
     prog     = await bot.send_message(chat_id, "📋 Reading media info...")
     with tempfile.TemporaryDirectory() as tmpdir:
-        path = await resolve_file(uid, tmpdir)
+        path = await get_input_source(uid, tmpdir)
         if not path:
             await prog.edit_text("❌ Could not download the file."); return
         if settings["mediainfo_mode"] == "simple":
@@ -290,7 +301,7 @@ async def process_mediainfo(uid: int, chat_id: int):
 async def process_thumb(uid: int, chat_id: int):
     prog = await bot.send_message(chat_id, "🖼 Extracting thumbnail...")
     with tempfile.TemporaryDirectory() as tmpdir:
-        path = await resolve_file(uid, tmpdir)
+        path = await get_input_source(uid, tmpdir)
         if not path:
             await prog.edit_text("❌ Could not download the file."); return
         out = os.path.join(tmpdir, "thumb.jpg")
