@@ -132,21 +132,23 @@ async def resolve_file(uid: int, tmpdir: str) -> Optional[str]:
 
     if tele_msg is not None:
         try:
-            logger.info(f"Starting Telethon download to {dest}...")
-            # 10-minute timeout — large files are slow but should not hang forever
-            result = await asyncio.wait_for(
-                tele.download_media(tele_msg, file=dest),
-                timeout=600
-            )
-            if result and os.path.exists(dest) and os.path.getsize(dest) > 0:
+            logger.info(f"Downloading via Telethon iter_download to {dest}...")
+            tele_doc = user_state.get(uid, {}).get("tele_doc")
+            if tele_doc is None:
+                logger.error("No tele_doc stored in user_state")
+                return None
+            # iter_download streams directly from Telegram's media DC
+            # It handles DC migration internally without hanging
+            with open(dest, "wb") as f:
+                async for chunk in tele.iter_download(tele_doc):
+                    f.write(chunk)
+            if os.path.exists(dest) and os.path.getsize(dest) > 0:
                 size_mb = os.path.getsize(dest) / 1024 / 1024
-                logger.info(f"Downloaded via Telethon: {dest} ({size_mb:.1f} MB)")
+                logger.info(f"Downloaded: {dest} ({size_mb:.1f} MB)")
                 return dest
-            logger.error(f"Telethon download_media returned empty. result={result}")
-        except asyncio.TimeoutError:
-            logger.error("Telethon download timed out after 10 minutes")
+            logger.error("iter_download produced empty file")
         except Exception as e:
-            logger.error(f"Telethon download_media error: {e}", exc_info=True)
+            logger.error(f"resolve_file error: {e}", exc_info=True)
         return None
 
     if link_text:
@@ -372,8 +374,14 @@ def register_handlers(client: TelegramClient):
                     parse_mode=ParseMode.MARKDOWN)
             except Exception: pass
             return
-        # KEY: store the Telethon Message object — download_media needs this exact object
-        user_state[uid] = {"tele_msg": msg, "file_name": file_name, "link_text": None, "step": None}
+        # Store Telethon msg + raw document for Bot API URL download
+        user_state[uid] = {
+            "tele_msg":  msg,
+            "tele_doc":  msg.document or msg.video,  # raw InputDocument for getFile
+            "file_name": file_name,
+            "link_text": None,
+            "step":      None,
+        }
         await db.touch_user(uid)
         await bot.send_message(chat_id,
             f"✅ *File received!*\n`{file_name}`\n\nChoose what to do:",
