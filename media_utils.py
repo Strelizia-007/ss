@@ -364,3 +364,65 @@ async def extract_thumbnail(input_path: str, output_path: str) -> bool:
         return True
 
     return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COVER ART EXTRACTION — all embedded image streams from file header
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def extract_covers(input_path: str, output_dir: str) -> list[str]:
+    """
+    Extract all embedded cover art / attached image streams.
+    MKV/MP4/MKA files often have cover.jpg, poster.jpg etc as attachment streams.
+    Returns list of extracted image paths.
+    """
+    covers = []
+
+    # Method 1: ffmpeg attached pics (stream type video, disposition attached_pic)
+    probe = run_ffprobe(input_path)
+    if probe:
+        streams = probe.get("streams", [])
+        img_streams = [
+            s for s in streams
+            if s.get("codec_type") == "video"
+            and s.get("disposition", {}).get("attached_pic", 0) == 1
+        ]
+        for i, s in enumerate(img_streams):
+            out = os.path.join(output_dir, f"cover_{i}.jpg")
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-map", f"0:{s['index']}",
+                "-frames:v", "1", "-q:v", "1", out
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+            )
+            await proc.wait()
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                covers.append(out)
+
+    # Method 2: ffmpeg attachment streams (MKV attachments like cover.jpg)
+    if probe:
+        att_streams = [
+            s for s in probe.get("streams", [])
+            if s.get("codec_type") == "attachment"
+        ]
+        for i, s in enumerate(att_streams):
+            fname = s.get("tags", {}).get("filename", f"attach_{i}")
+            ext   = os.path.splitext(fname)[1].lower()
+            if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+                continue
+            out = os.path.join(output_dir, f"attach_{i}{ext}")
+            cmd = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-map", f"0:{s['index']}",
+                "-frames:v", "1", "-q:v", "1", out
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+            )
+            await proc.wait()
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                covers.append(out)
+
+    return covers
