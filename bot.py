@@ -392,7 +392,7 @@ async def process_sample(uid: int, chat_id: int):
             await prog.edit_text("❌ Could not get file source."); return
         out = os.path.join(tmpdir, "_sample_out.mp4")   # underscore = never confused with source
         total_dur = user_state.get(uid, {}).get("duration", 0.0)
-        if await generate_sample_video(source, dur, out, total_duration=total_dur):
+        if await generate_sample_video(source, dur, out, total_dur):
             await bot.send_video(chat_id, open(out,"rb"), caption=f"🎞 Sample ({dur}s)")
             await db.increment_stat(uid, "samples")
         else:
