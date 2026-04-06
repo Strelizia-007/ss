@@ -124,58 +124,13 @@ def settings_keyboard(s: dict):
 #  INPUT SOURCE — returns a streamable URL or local path for ffmpeg
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _stream_to_fifo(tele_doc, fifo_path: str, stop_event: asyncio.Event):
-    """
-    Stream Telethon document chunks into a FIFO pipe.
-    Stops cleanly when ffmpeg closes the read end (stop_event set or EPIPE).
-    Uses GetFileRequest directly on the document's own DC — no borrowed sender hang.
-    """
-    from telethon.tl.types import InputDocumentFileLocation
-    from telethon.tl.functions.upload import GetFileRequest
-
-    loc = InputDocumentFileLocation(
-        id=tele_doc.id,
-        access_hash=tele_doc.access_hash,
-        file_reference=tele_doc.file_reference,
-        thumb_size="",
-    )
-    sender = await tele._borrow_exported_sender(tele_doc.dc_id)
-    try:
-        chunk_size = 512 * 1024
-        offset     = 0
-        total      = tele_doc.size
-        loop       = asyncio.get_event_loop()
-        fd         = await loop.run_in_executor(None, os.open, fifo_path, os.O_WRONLY)
-        try:
-            while offset < total and not stop_event.is_set():
-                result = await sender.send(GetFileRequest(
-                    location=loc, offset=offset, limit=chunk_size,
-                    precise=True, cdn_supported=False,
-                ))
-                chunk = result.bytes
-                if not chunk:
-                    break
-                try:
-                    await loop.run_in_executor(None, os.write, fd, chunk)
-                except OSError:
-                    # ffmpeg closed the pipe (got what it needed) — normal exit
-                    break
-                offset += len(chunk)
-        finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-    finally:
-        await tele._return_exported_sender(sender)
-
-
 async def get_input_source(uid: int, tmpdir: str) -> Optional[str]:
     """
     Returns a source path/URL that ffmpeg can read:
-    - Small TG files (≤20MB): Bot API HTTPS URL — ffmpeg streams directly
-    - Large TG files (>20MB): FIFO pipe path — Telethon chunks fed on demand
-    - Direct links: URL returned as-is
+    - Small TG files (≤20MB): Bot API HTTPS URL — ffmpeg HTTP-seeks, no download
+    - Large TG files (>20MB): FIFO pipe — DC sender pre-connected BEFORE pipe opens,
+                               so ffmpeg gets data immediately with no hang
+    - Direct links: URL as-is (ffmpeg streams natively)
     - GDrive: downloaded to tmpdir
     """
     state     = user_state.get(uid, {})
@@ -184,7 +139,7 @@ async def get_input_source(uid: int, tmpdir: str) -> Optional[str]:
     file_name = state.get("file_name", "video.mp4")
 
     if tele_doc is not None:
-        # Try Bot API getFile first (works for ≤20MB, instant URL)
+        # ── Small file: Bot API URL (instant, ffmpeg HTTP-seeks) ─────────────
         import httpx as _httpx
         try:
             from telethon.utils import pack_bot_file_id
@@ -203,22 +158,78 @@ async def get_input_source(uid: int, tmpdir: str) -> Optional[str]:
                     fp  = data["result"]["file_path"]
                     url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{fp}"
                     user_state[uid]["stream_url"] = url
-                    logger.info(f"Stream URL (≤20MB): {url}")
+                    logger.info(f"Bot API stream URL: {url}")
                     return url
         except Exception:
             pass
 
-        # Large file (>20MB): create a FIFO and stream Telethon chunks into it
-        # ffmpeg reads from the pipe and stops when it has what it needs
+        # ── Large file: FIFO pipe with pre-connected DC sender ────────────────
+        # CRITICAL ORDER:
+        #   1. Connect to DC and borrow sender FIRST (this takes ~10s on first use)
+        #   2. Only then create FIFO and start ffmpeg
+        #   3. ffmpeg opens FIFO read-end → we open write-end instantly → no hang
+        from telethon.tl.types import InputDocumentFileLocation
+        from telethon.tl.functions.upload import GetFileRequest
+
+        logger.info(f"Large file — pre-connecting to DC{tele_doc.dc_id}...")
+        try:
+            sender = await tele._borrow_exported_sender(tele_doc.dc_id)
+        except Exception as e:
+            logger.error(f"DC sender connection failed: {e}")
+            return None
+        logger.info(f"DC{tele_doc.dc_id} sender ready ✅")
+
+        loc        = InputDocumentFileLocation(
+            id=tele_doc.id,
+            access_hash=tele_doc.access_hash,
+            file_reference=tele_doc.file_reference,
+            thumb_size="",
+        )
         fifo_path  = os.path.join(tmpdir, "stream.mkv")
         stop_event = asyncio.Event()
         os.mkfifo(fifo_path)
-        logger.info(f"FIFO pipe for large file: {fifo_path}")
-        # Start streamer as background task — ffmpeg will drain it
-        asyncio.create_task(_stream_to_fifo(tele_doc, fifo_path, stop_event))
-        # Store stop_event so we can cancel streaming after ffmpeg finishes
         user_state[uid]["fifo_stop"] = stop_event
-        user_state[uid]["fifo_path"] = fifo_path
+
+        async def _feed_fifo():
+            loop       = asyncio.get_event_loop()
+            chunk_size = 512 * 1024
+            offset     = 0
+            total      = tele_doc.size
+            # Open write-end in executor (blocks until ffmpeg opens read-end)
+            try:
+                fd = await loop.run_in_executor(None, os.open, fifo_path, os.O_WRONLY)
+            except Exception as e:
+                logger.error(f"FIFO open failed: {e}")
+                await tele._return_exported_sender(sender)
+                return
+            try:
+                while offset < total and not stop_event.is_set():
+                    try:
+                        result = await sender.send(GetFileRequest(
+                            location=loc, offset=offset, limit=chunk_size,
+                            precise=True, cdn_supported=False,
+                        ))
+                    except Exception as e:
+                        logger.error(f"GetFileRequest error: {e}")
+                        break
+                    chunk = result.bytes
+                    if not chunk:
+                        break
+                    try:
+                        await loop.run_in_executor(None, os.write, fd, chunk)
+                    except OSError:
+                        break  # ffmpeg closed pipe — it got what it needed
+                    offset += len(chunk)
+                    if offset % (20 * 1024 * 1024) < chunk_size:
+                        logger.info(f"FIFO fed: {offset//1024//1024}MB / {total//1024//1024}MB")
+            finally:
+                try: os.close(fd)
+                except OSError: pass
+                await tele._return_exported_sender(sender)
+                logger.info("FIFO streamer done")
+
+        asyncio.create_task(_feed_fifo())
+        logger.info(f"FIFO ready: {fifo_path}")
         return fifo_path
 
     if link_text:
