@@ -285,7 +285,8 @@ async def process_screenshots(uid: int, chat_id: int, count: int):
         path = await get_input_source(uid, tmpdir)
         if not path:
             await prog.edit_text("❌ Could not get file source."); return
-        images = await generate_screenshots(path, count, tmpdir, settings["scht_gen_mode"])
+        dur    = user_state.get(uid, {}).get("duration", 0.0)
+        images = await generate_screenshots(path, count, tmpdir, settings["scht_gen_mode"], duration=dur)
         if not images:
             await prog.edit_text("❌ Screenshot generation failed."); return
         await db.increment_stat(uid, "screenshots")
@@ -317,7 +318,8 @@ async def process_sample(uid: int, chat_id: int):
         if not source:
             await prog.edit_text("❌ Could not get file source."); return
         out = os.path.join(tmpdir, "_sample_out.mp4")   # underscore = never confused with source
-        if await generate_sample_video(source, dur, out):
+        total_dur = user_state.get(uid, {}).get("duration", 0.0)
+        if await generate_sample_video(source, dur, out, total_duration=total_dur):
             await bot.send_video(chat_id, open(out,"rb"), caption=f"🎞 Sample ({dur}s)")
             await db.increment_stat(uid, "samples")
         else:
@@ -565,13 +567,24 @@ def register_handlers(client: TelegramClient):
                     parse_mode=ParseMode.MARKDOWN)
             except Exception: pass
             return
-        # Store Telethon msg + raw document for Bot API URL download
+        # Extract duration from document attributes — avoids needing ffprobe on FIFO
+        doc = msg.document or msg.video
+        duration = 0.0
+        if doc:
+            for attr in doc.attributes:
+                d = getattr(attr, "duration", None)
+                if d:
+                    duration = float(d)
+                    break
+
+        # Store Telethon msg + raw document + pre-known duration
         user_state[uid] = {
             "tele_msg":  msg,
-            "tele_doc":  msg.document or msg.video,  # raw InputDocument for getFile
+            "tele_doc":  doc,
             "file_name": file_name,
             "link_text": None,
             "step":      None,
+            "duration":  duration,   # seconds, from Telegram metadata
         }
         await db.touch_user(uid)
         await bot.send_message(chat_id,
