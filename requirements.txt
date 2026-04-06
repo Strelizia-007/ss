@@ -4,3 +4,4 @@ motor
 httpx
 gdown
 Pillow
+aiohttp
