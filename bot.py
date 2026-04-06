@@ -121,17 +121,154 @@ def settings_keyboard(s: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  INPUT SOURCE — returns a streamable URL or local path for ffmpeg
+#  TELEGRAM HTTP PROXY — serves file to ffmpeg with Range request support
+#  ffmpeg can HTTP-seek to any position → downloads only what it needs
+# ══════════════════════════════════════════════════════════════════════════════
+
+import asyncio, socket
+from aiohttp import web
+
+# Active proxy servers: uid → (runner, url)
+_proxy_servers: dict = {}
+
+
+async def _start_proxy(uid: int, tele_doc) -> Optional[str]:
+    """
+    Start a localhost HTTP server that proxies the Telegram file.
+    Returns URL like http://127.0.0.1:PORT/file
+    Supports HTTP Range requests so ffmpeg can seek without full download.
+    """
+    from telethon.tl.types import InputDocumentFileLocation
+    from telethon.tl.functions.upload import GetFileRequest
+
+    # Stop any existing proxy for this user
+    await _stop_proxy(uid)
+
+    # Pre-connect DC sender once — reused for all range requests
+    logger.info(f"Proxy: connecting to DC{tele_doc.dc_id}...")
+    try:
+        sender = await tele._borrow_exported_sender(tele_doc.dc_id)
+    except Exception as e:
+        logger.error(f"Proxy: DC connect failed: {e}")
+        return None
+    logger.info(f"Proxy: DC{tele_doc.dc_id} ready ✅")
+
+    loc = InputDocumentFileLocation(
+        id=tele_doc.id,
+        access_hash=tele_doc.access_hash,
+        file_reference=tele_doc.file_reference,
+        thumb_size="",
+    )
+    total_size = tele_doc.size
+    chunk_size = 512 * 1024   # 512KB per Telegram request
+
+    async def handle(request: web.Request) -> web.StreamResponse:
+        # Parse Range header: bytes=START-END
+        rng   = request.headers.get("Range", "")
+        start = 0
+        end   = total_size - 1
+        status = 200
+        if rng.startswith("bytes="):
+            parts = rng[6:].split("-")
+            try:
+                start = int(parts[0]) if parts[0] else 0
+                end   = int(parts[1]) if parts[1] else total_size - 1
+                status = 206
+            except Exception:
+                pass
+
+        content_length = end - start + 1
+        resp = web.StreamResponse(status=status)
+        resp.headers["Content-Type"]   = "video/x-matroska"
+        resp.headers["Accept-Ranges"]  = "bytes"
+        resp.headers["Content-Length"] = str(content_length)
+        if status == 206:
+            resp.headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+        await resp.prepare(request)
+
+        # Fetch chunks from Telegram starting at `start`, aligned to chunk_size
+        offset     = (start // chunk_size) * chunk_size
+        skip_bytes = start - offset
+        sent       = 0
+
+        while sent < content_length:
+            try:
+                result = await sender.send(GetFileRequest(
+                    location=loc, offset=offset, limit=chunk_size,
+                    precise=True, cdn_supported=False,
+                ))
+            except Exception as e:
+                logger.error(f"Proxy GetFileRequest error: {e}")
+                break
+
+            chunk = result.bytes
+            if not chunk:
+                break
+
+            # Skip bytes before `start` on first chunk
+            if skip_bytes > 0:
+                chunk      = chunk[skip_bytes:]
+                skip_bytes = 0
+
+            # Trim to exactly what was requested
+            remaining = content_length - sent
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining]
+
+            try:
+                await resp.write(chunk)
+            except Exception:
+                break  # ffmpeg closed connection — it got what it needed
+
+            sent   += len(chunk)
+            offset += chunk_size
+
+        return resp
+
+    # Find a free port and start the server
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    app    = web.Application()
+    app.router.add_get("/file", handle)
+    app.router.add_head("/file", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site   = web.TCPSite(runner, "127.0.0.1", port)
+    await site.start()
+
+    url = f"http://127.0.0.1:{port}/file"
+    _proxy_servers[uid] = (runner, sender)
+    logger.info(f"Proxy started: {url} ({total_size//1024//1024}MB)")
+    return url
+
+
+async def _stop_proxy(uid: int):
+    if uid in _proxy_servers:
+        runner, sender = _proxy_servers.pop(uid)
+        try:
+            await runner.cleanup()
+        except Exception:
+            pass
+        try:
+            await tele._return_exported_sender(sender)
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INPUT SOURCE
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def get_input_source(uid: int, tmpdir: str) -> Optional[str]:
     """
-    Returns a source path/URL that ffmpeg can read:
-    - Small TG files (≤20MB): Bot API HTTPS URL — ffmpeg HTTP-seeks, no download
-    - Large TG files (>20MB): FIFO pipe — DC sender pre-connected BEFORE pipe opens,
-                               so ffmpeg gets data immediately with no hang
-    - Direct links: URL as-is (ffmpeg streams natively)
-    - GDrive: downloaded to tmpdir
+    Returns a URL/path that ffmpeg can HTTP-seek:
+    - TG files ≤20MB : Bot API direct URL
+    - TG files >20MB : localhost proxy URL (Range-request capable)
+    - Direct links   : URL as-is
+    - GDrive         : downloaded to tmpdir
     """
     state     = user_state.get(uid, {})
     tele_doc  = state.get("tele_doc")
@@ -139,7 +276,11 @@ async def get_input_source(uid: int, tmpdir: str) -> Optional[str]:
     file_name = state.get("file_name", "video.mp4")
 
     if tele_doc is not None:
-        # ── Small file: Bot API URL (instant, ffmpeg HTTP-seeks) ─────────────
+        # Return cached proxy/URL if already running
+        if state.get("stream_url"):
+            return state["stream_url"]
+
+        # Try Bot API getFile (works for ≤20MB)
         import httpx as _httpx
         try:
             from telethon.utils import pack_bot_file_id
@@ -158,79 +299,16 @@ async def get_input_source(uid: int, tmpdir: str) -> Optional[str]:
                     fp  = data["result"]["file_path"]
                     url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{fp}"
                     user_state[uid]["stream_url"] = url
-                    logger.info(f"Bot API stream URL: {url}")
+                    logger.info(f"Bot API URL (≤20MB): {url}")
                     return url
         except Exception:
             pass
 
-        # ── Large file: FIFO pipe with pre-connected DC sender ────────────────
-        # CRITICAL ORDER:
-        #   1. Connect to DC and borrow sender FIRST (this takes ~10s on first use)
-        #   2. Only then create FIFO and start ffmpeg
-        #   3. ffmpeg opens FIFO read-end → we open write-end instantly → no hang
-        from telethon.tl.types import InputDocumentFileLocation
-        from telethon.tl.functions.upload import GetFileRequest
-
-        logger.info(f"Large file — pre-connecting to DC{tele_doc.dc_id}...")
-        try:
-            sender = await tele._borrow_exported_sender(tele_doc.dc_id)
-        except Exception as e:
-            logger.error(f"DC sender connection failed: {e}")
-            return None
-        logger.info(f"DC{tele_doc.dc_id} sender ready ✅")
-
-        loc        = InputDocumentFileLocation(
-            id=tele_doc.id,
-            access_hash=tele_doc.access_hash,
-            file_reference=tele_doc.file_reference,
-            thumb_size="",
-        )
-        fifo_path  = os.path.join(tmpdir, "stream.mkv")
-        stop_event = asyncio.Event()
-        os.mkfifo(fifo_path)
-        user_state[uid]["fifo_stop"] = stop_event
-
-        async def _feed_fifo():
-            loop       = asyncio.get_event_loop()
-            chunk_size = 512 * 1024
-            offset     = 0
-            total      = tele_doc.size
-            # Open write-end in executor (blocks until ffmpeg opens read-end)
-            try:
-                fd = await loop.run_in_executor(None, os.open, fifo_path, os.O_WRONLY)
-            except Exception as e:
-                logger.error(f"FIFO open failed: {e}")
-                await tele._return_exported_sender(sender)
-                return
-            try:
-                while offset < total and not stop_event.is_set():
-                    try:
-                        result = await sender.send(GetFileRequest(
-                            location=loc, offset=offset, limit=chunk_size,
-                            precise=True, cdn_supported=False,
-                        ))
-                    except Exception as e:
-                        logger.error(f"GetFileRequest error: {e}")
-                        break
-                    chunk = result.bytes
-                    if not chunk:
-                        break
-                    try:
-                        await loop.run_in_executor(None, os.write, fd, chunk)
-                    except OSError:
-                        break  # ffmpeg closed pipe — it got what it needed
-                    offset += len(chunk)
-                    if offset % (20 * 1024 * 1024) < chunk_size:
-                        logger.info(f"FIFO fed: {offset//1024//1024}MB / {total//1024//1024}MB")
-            finally:
-                try: os.close(fd)
-                except OSError: pass
-                await tele._return_exported_sender(sender)
-                logger.info("FIFO streamer done")
-
-        asyncio.create_task(_feed_fifo())
-        logger.info(f"FIFO ready: {fifo_path}")
-        return fifo_path
+        # Large file: start local proxy server
+        url = await _start_proxy(uid, tele_doc)
+        if url:
+            user_state[uid]["stream_url"] = url
+        return url
 
     if link_text:
         ltype, identifier = detect_link_type(link_text)
@@ -263,15 +341,11 @@ async def send_completion(chat_id: int, seconds: float):
 
 
 def cleanup_fifo(uid: int):
-    """Signal FIFO streamer to stop and clear cached stream URL."""
+    """Stop proxy server and clear cached stream URL after task completes."""
     state = user_state.get(uid, {})
-    stop  = state.get("fifo_stop")
-    if stop:
-        stop.set()
-    # Clear cached URL/FIFO so next action gets a fresh source
     state.pop("stream_url", None)
-    state.pop("fifo_stop",  None)
-    state.pop("fifo_path",  None)
+    # Schedule proxy shutdown (non-blocking)
+    asyncio.create_task(_stop_proxy(uid))
 
 async def process_screenshots(uid: int, chat_id: int, count: int):
     import time
