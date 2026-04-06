@@ -124,12 +124,59 @@ def settings_keyboard(s: dict):
 #  INPUT SOURCE — returns a streamable URL or local path for ffmpeg
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def _stream_to_fifo(tele_doc, fifo_path: str, stop_event: asyncio.Event):
+    """
+    Stream Telethon document chunks into a FIFO pipe.
+    Stops cleanly when ffmpeg closes the read end (stop_event set or EPIPE).
+    Uses GetFileRequest directly on the document's own DC — no borrowed sender hang.
+    """
+    from telethon.tl.types import InputDocumentFileLocation
+    from telethon.tl.functions.upload import GetFileRequest
+
+    loc = InputDocumentFileLocation(
+        id=tele_doc.id,
+        access_hash=tele_doc.access_hash,
+        file_reference=tele_doc.file_reference,
+        thumb_size="",
+    )
+    sender = await tele._borrow_exported_sender(tele_doc.dc_id)
+    try:
+        chunk_size = 512 * 1024
+        offset     = 0
+        total      = tele_doc.size
+        loop       = asyncio.get_event_loop()
+        fd         = await loop.run_in_executor(None, os.open, fifo_path, os.O_WRONLY)
+        try:
+            while offset < total and not stop_event.is_set():
+                result = await sender.send(GetFileRequest(
+                    location=loc, offset=offset, limit=chunk_size,
+                    precise=True, cdn_supported=False,
+                ))
+                chunk = result.bytes
+                if not chunk:
+                    break
+                try:
+                    await loop.run_in_executor(None, os.write, fd, chunk)
+                except OSError:
+                    # ffmpeg closed the pipe (got what it needed) — normal exit
+                    break
+                offset += len(chunk)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    finally:
+        await tele._return_exported_sender(sender)
+
+
 async def get_input_source(uid: int, tmpdir: str) -> Optional[str]:
     """
-    Returns a source that ffmpeg can read directly:
-    - For Telegram files: a Telegram HTTPS URL (ffmpeg streams it, no full download)
-    - For direct links: the URL itself
-    - For GDrive: downloads to tmpdir and returns local path
+    Returns a source path/URL that ffmpeg can read:
+    - Small TG files (≤20MB): Bot API HTTPS URL — ffmpeg streams directly
+    - Large TG files (>20MB): FIFO pipe path — Telethon chunks fed on demand
+    - Direct links: URL returned as-is
+    - GDrive: downloaded to tmpdir
     """
     state     = user_state.get(uid, {})
     tele_doc  = state.get("tele_doc")
@@ -137,11 +184,7 @@ async def get_input_source(uid: int, tmpdir: str) -> Optional[str]:
     file_name = state.get("file_name", "video.mp4")
 
     if tele_doc is not None:
-        # Return cached URL if already fetched
-        if user_state[uid].get("stream_url"):
-            logger.info(f"Using cached stream URL")
-            return user_state[uid]["stream_url"]
-
+        # Try Bot API getFile first (works for ≤20MB, instant URL)
         import httpx as _httpx
         try:
             from telethon.utils import pack_bot_file_id
@@ -150,8 +193,8 @@ async def get_input_source(uid: int, tmpdir: str) -> Optional[str]:
             file_id = str(tele_doc.id)
 
         try:
-            async with _httpx.AsyncClient(timeout=30) as cl:
-                r = await cl.get(
+            async with _httpx.AsyncClient(timeout=15) as cl:
+                r    = await cl.get(
                     f"https://api.telegram.org/bot{config.BOT_TOKEN}/getFile",
                     params={"file_id": file_id}
                 )
@@ -159,20 +202,29 @@ async def get_input_source(uid: int, tmpdir: str) -> Optional[str]:
                 if data.get("ok"):
                     fp  = data["result"]["file_path"]
                     url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{fp}"
-                    # Cache URL so repeated calls don't re-fetch
                     user_state[uid]["stream_url"] = url
-                    logger.info(f"Stream URL: {url}")
+                    logger.info(f"Stream URL (≤20MB): {url}")
                     return url
-                logger.error(f"getFile failed: {data.get('description')}")
-                return None
-        except Exception as e:
-            logger.error(f"getFile failed: {e}")
-            return None
+        except Exception:
+            pass
+
+        # Large file (>20MB): create a FIFO and stream Telethon chunks into it
+        # ffmpeg reads from the pipe and stops when it has what it needs
+        fifo_path  = os.path.join(tmpdir, "stream.mkv")
+        stop_event = asyncio.Event()
+        os.mkfifo(fifo_path)
+        logger.info(f"FIFO pipe for large file: {fifo_path}")
+        # Start streamer as background task — ffmpeg will drain it
+        asyncio.create_task(_stream_to_fifo(tele_doc, fifo_path, stop_event))
+        # Store stop_event so we can cancel streaming after ffmpeg finishes
+        user_state[uid]["fifo_stop"] = stop_event
+        user_state[uid]["fifo_path"] = fifo_path
+        return fifo_path
 
     if link_text:
         ltype, identifier = detect_link_type(link_text)
         if ltype == "direct":
-            return identifier          # ffmpeg can stream direct URLs natively
+            return identifier
         elif ltype == "gdrive_file":
             dest = os.path.join(tmpdir, file_name)
             ok   = await download_gdrive_file(identifier, dest)
@@ -189,16 +241,26 @@ RATE_URL = "https://t.me/botsarchive"   # change to your bot's review link
 
 async def send_completion(chat_id: int, seconds: float):
     """Send the standard completion footer after every task."""
-    text = (
-        f"✅ Successfully completed process in *{seconds:.0f}s*"
-      
-        f"If you find me helpful, please [rate me here]({RATE_URL})."
-      
+    msg = (
+        f"✅ Successfully completed process in *{seconds:.0f}s*\n\n"
+        f"If you find me helpful, please [rate me here]({RATE_URL})\.\n\n"
         f"💝 Support the bot with /donate and get *extended limits* too\!"
     )
-    await bot.send_message(chat_id, text,
+    await bot.send_message(chat_id, msg,
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True)
+
+
+def cleanup_fifo(uid: int):
+    """Signal FIFO streamer to stop and clear cached stream URL."""
+    state = user_state.get(uid, {})
+    stop  = state.get("fifo_stop")
+    if stop:
+        stop.set()
+    # Clear cached URL/FIFO so next action gets a fresh source
+    state.pop("stream_url", None)
+    state.pop("fifo_stop",  None)
+    state.pop("fifo_path",  None)
 
 async def process_screenshots(uid: int, chat_id: int, count: int):
     import time
@@ -226,6 +288,7 @@ async def process_screenshots(uid: int, chat_id: int, count: int):
             media = [InputMediaPhoto(open(p,"rb").read()) for p in images]
             await bot.send_media_group(chat_id, media)
     await prog.delete()
+    cleanup_fifo(uid)
     await send_completion(chat_id, time.time() - t0)
 
 
@@ -249,6 +312,7 @@ async def process_sample(uid: int, chat_id: int):
         else:
             await prog.edit_text("❌ Sample generation failed."); return
     await prog.delete()
+    cleanup_fifo(uid)
     await send_completion(chat_id, time.time() - t0)
 
 
@@ -267,6 +331,7 @@ async def process_trim(uid: int, chat_id: int, start: str, end: str):
         else:
             await prog.edit_text("❌ Trim failed. Check time values."); return
     await prog.delete()
+    cleanup_fifo(uid)
     await send_completion(chat_id, time.time() - t0)
 
 
@@ -291,9 +356,11 @@ async def process_mediainfo(uid: int, chat_id: int):
             tg_url   = await upload_to_telegraph(f"MediaInfo · {file_name}", full, config.TELEGRAPH_TOKEN)
 
             # Build caption
-            caption = f"📊 *MediaInfo of* `{file_name}`"
+            caption = f"📊 *MediaInfo of* `{file_name}`
+"
             if tg_url:
-                caption += f"[🔗 View on Telegraph]({tg_url})"
+                caption += f"
+[🔗 View on Telegraph]({tg_url})"
             await bot.send_message(chat_id, caption, parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=False)
 
@@ -309,6 +376,7 @@ async def process_mediainfo(uid: int, chat_id: int):
 
         await db.increment_stat(uid, "mediainfos")
     await prog.delete()
+    cleanup_fifo(uid)
     await send_completion(chat_id, time.time() - t0)
 
 
@@ -373,6 +441,7 @@ async def process_thumb(uid: int, chat_id: int, covers: bool = False):
                 await prog.edit_text("❌ Thumbnail extraction failed."); return
 
     await prog.delete()
+    cleanup_fifo(uid)
     await send_completion(chat_id, time.time() - t0)
 
 
@@ -453,10 +522,14 @@ def register_handlers(client: TelegramClient):
         elif action == "toggle_wm_photo":await db.update_user_setting(uid, "watermark_photo",  not s["watermark_photo"])
         s = await db.get_user_settings(uid)
         try:
-            await bot.send_message(event.chat_id,
-                "⚙️ *Settings* — tap a button to toggle.",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=settings_keyboard(s))
-        except Exception: pass
+            # Edit the existing settings message in-place — no duplicate messages
+            await bot.edit_message_reply_markup(
+                chat_id=event.chat_id,
+                message_id=event.message_id,
+                reply_markup=settings_keyboard(s)
+            )
+        except Exception:
+            pass
 
     # Media received — store Telethon Message object directly
     @client.on(events.NewMessage(func=lambda e: bool(e.media) and not e.text.startswith("/")))
