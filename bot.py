@@ -233,7 +233,6 @@ async def _start_proxy(uid: int, tele_doc) -> Optional[str]:
 
     app    = web.Application()
     app.router.add_get("/file", handle)
-    app.router.add_head("/file", handle)
     runner = web.AppRunner(app)
     await runner.setup()
     site   = web.TCPSite(runner, "127.0.0.1", port)
@@ -794,12 +793,13 @@ def register_handlers(client: TelegramClient):
     async def on_join_request(update):
         try:
             user_id    = update.user_id
-            channel_id = update.peer.channel_id if hasattr(update.peer, "channel_id") else None
+            channel_id = getattr(update.peer, "channel_id", None)
             fsub_id    = int(str(config.FSUB_CHANNEL_ID).replace("-100", ""))
             if channel_id != fsub_id:
                 return
-            await tele(tl_types.channels.HideInviteRequest(
-                channel=await tele.get_input_entity(config.FSUB_CHANNEL_ID),
+            from telethon.tl.functions.messages import HideChatJoinRequestRequest
+            await tele(HideChatJoinRequestRequest(
+                peer=await tele.get_input_entity(config.FSUB_CHANNEL_ID),
                 user_id=await tele.get_input_entity(user_id),
                 approved=True,
             ))
